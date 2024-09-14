@@ -2,6 +2,7 @@
 
 Bots that upload code from file when it changes to discord server
 
+<img src="./showcase.png"/>
 
 ## Setup
 
