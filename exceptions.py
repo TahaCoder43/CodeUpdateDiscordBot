@@ -4,3 +4,7 @@ class StarterMessageNotFound(Exception):
 
 class EnvNotProvided(Exception):
     """Providing .env file is a must and the bot cannot work without it"""
+
+
+class NeitherLineNorKeyProvided(Exception):
+    """handle_watchfile_command() needs either a line, or a key. If both are not provided this error is raised"""

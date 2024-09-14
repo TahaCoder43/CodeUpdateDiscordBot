@@ -1,8 +1,11 @@
-from typing import Dict, Union
+from typing import Dict, List, Union
 import discord
 import asyncio
 import os
 import exceptions
+
+# TODO: Bot should verify that the proper numbers of arguments are added
+# TODO: Bot should check .watchfiles to see if it's updated too
 
 try:
     with open(".env", "r") as file:
@@ -16,7 +19,18 @@ except FileNotFoundError:
 STUDENT_ID = env_vars.get("STUDENT_ID")
 MENTOR_ID = env_vars.get("MENTOR_ID")
 LOGGING_CHANNEL_ID = env_vars.get("LOGGING_CHANNEL_ID")
+FILE_CHECK_INTERVAL = env_vars.get("FILE_CHECK_INTERVAL")
+WATCHFILE_CHECK_INTERVAL = env_vars.get("WATCHFILE_CHECK_INTERVAL")
 BOT_TOKEN = env_vars["BOT_TOKEN"]
+
+if FILE_CHECK_INTERVAL is None:
+    FILE_CHECK_INTERVAL = 3
+else:
+    FILE_CHECK_INTERVAL = int(FILE_CHECK_INTERVAL)
+if WATCHFILE_CHECK_INTERVAL is None:
+    WATCHFILE_CHECK_INTERVAL = 7
+else:
+    WATCHFILE_CHECK_INTERVAL = int(WATCHFILE_CHECK_INTERVAL)
 
 MessageableChannel = Union[
     discord.TextChannel,
@@ -71,7 +85,9 @@ async def send_denial(message: discord.Message):
 class FileUpdateBot(discord.Client):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.background_tasks = []
+        self.background_tasks: List[asyncio.Task] = []
+        self.default_background_tasks: Dict[str, asyncio.Task] = {}
+        self.default_background_task_running: Dict[str, bool] = {}
         self.logging_channel: None | MessageableChannel = None
 
     async def log(self, message: str):
@@ -112,7 +128,8 @@ class FileUpdateBot(discord.Client):
         dot_index = filepath.find(".")
         extension = filepath[dot_index + 1 :]
 
-        while not self.is_closed():
+        key = f"forum-watch|{channel.id}|{filepath}"
+        while not self.is_closed() and self.default_background_task_running[key]:
             if has_file_updated(filepath, stamp):
                 stamp = os.stat(filepath).st_mtime
                 code = ""
@@ -121,7 +138,7 @@ class FileUpdateBot(discord.Client):
                 message = prepare_message(filepath, extension, code)
                 await channel.send(message)
 
-            await asyncio.sleep(3)
+            await asyncio.sleep(FILE_CHECK_INTERVAL)
 
     async def forum_watch_file(
         self,
@@ -150,7 +167,8 @@ class FileUpdateBot(discord.Client):
             file_thread = file_thread_with_message.thread
             await file_thread.send(message)
 
-        while not self.is_closed():
+        key = f"forum-watch|{channel.id}|{filepath}"
+        while not self.is_closed() and self.default_background_task_running[key]:
             code = ""
             if has_file_updated(filepath, stamp):
                 stamp = os.stat(filepath).st_mtime
@@ -166,11 +184,21 @@ class FileUpdateBot(discord.Client):
                     raise exceptions.StarterMessageNotFound("starter_message is None")
                 await first_message.edit(content=forum_content)
                 await file_thread.send(message)
-            await asyncio.sleep(3)
+            await asyncio.sleep(FILE_CHECK_INTERVAL)
         return True
 
-    async def handle_watchfile_command(self, line: str) -> None:
-        split_command = escapeable_split(line)
+    async def handle_watchfile_command(
+        self, line: str | None = None, key: str | None = None
+    ) -> None:
+        if line is not None:
+            split_command = escapeable_split(line)
+        elif key is not None:
+            split_command = escapeable_split(key, "|")
+        else:
+            raise exceptions.NeitherLineNorKeyProvided(
+                "Provide a line, or a key to handle_watchfile_command()"
+            )
+
         command = split_command[0]
         match command:
             case "watch":
@@ -184,8 +212,10 @@ class FileUpdateBot(discord.Client):
                     await self.log(f"I cannot send message in <#{channel_id}>")
                     return
 
-                self.background_tasks.append(
-                    self.loop.create_task(self.watch_file(filepath, channel))
+                key = f"{command}|{channel_id}|{filepath}"
+                self.default_background_task_running[key] = True
+                self.default_background_tasks[key] = self.loop.create_task(
+                    self.watch_file(filepath, channel)
                 )
                 await self.log(f"Watching {filepath} 🤖 in <#{channel_id}>")
             case "forum-watch":
@@ -199,16 +229,50 @@ class FileUpdateBot(discord.Client):
                     await self.log(f"<#{channel_id}> is not a forum channel")
                     return
 
-                self.background_tasks.append(
-                    self.loop.create_task(self.forum_watch_file(filepath, channel))
+                key = f"{command}|{channel_id}|{filepath}"
+                self.default_background_task_running[key] = True
+                self.default_background_tasks[key] = self.loop.create_task(
+                    self.forum_watch_file(filepath, channel)
                 )
                 await self.log(f"Watching {filepath} 🤖 in <#{channel_id}>")
 
     async def watch_default_files(self):
-        with open(".watchfiles", "r") as file:
-            watch_info = file.read().splitlines()
-            for line in watch_info:
-                await self.handle_watchfile_command(line)
+        filepath = ".watchfiles"
+        while not os.path.exists(filepath) and not self.is_closed():
+            await asyncio.sleep(WATCHFILE_CHECK_INTERVAL)
+        commands = ""
+        with open(filepath, "r") as file:
+            commands = file.read().splitlines()
+        for command in commands:
+            await self.handle_watchfile_command(command)
+
+        stamp = os.stat(filepath).st_mtime
+
+        while not self.is_closed():
+            if has_file_updated(filepath, stamp):
+                stamp = os.stat(filepath).st_mtime
+                # key is command|channel_name|filename
+                # Conditions, if key in new tasks and running, keep running
+                # if key in new taks, but not running, then start running
+                # if new tasks does not exist in key, then add key and start running
+                # if key not exists in new tasks, then stop runnig
+
+                with open(filepath, "r") as file:
+                    commands = file.read()
+                    new_tasks: set[str] = {
+                        command.replace(" ", "|") for command in commands.splitlines()
+                    }
+                keys = set(self.default_background_task_running.keys())
+                for key in new_tasks.intersection(keys):
+                    running = self.default_background_task_running[key]
+                    if not running:
+                        await self.handle_watchfile_command(key)
+                for key in new_tasks.difference(keys):
+                    await self.handle_watchfile_command(key)
+                for key in keys.difference(new_tasks):
+                    self.default_background_task_running[key] = False
+
+            await asyncio.sleep(WATCHFILE_CHECK_INTERVAL)
 
     async def handle_commands(self, message: discord.Message):
         isMentor = await self.find_is_mentor(message)
